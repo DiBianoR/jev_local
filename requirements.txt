@@ -1,0 +1,5 @@
+# Tested 2026-09-26, Python >= 3.10. HTTP to llama-server uses the standard library.
+typesafe-sdk==0.7.1
+system-one-adapter==0.2.1   # TypeSafe's LLM adapter (MIT): jev-local imports its prompt wording and schema builder
+# optional, only if you call it from LangChain:
+# langchain-typesafe==0.0.1a3
