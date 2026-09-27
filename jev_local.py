@@ -26,9 +26,11 @@ negative" / "very positive") are expanded from their exact token-ID path. Verifi
 against exhaustive brute force.
 
 Hybrid models (Qwen3.8 = Gated-DeltaNet + attention): the recurrent state can only be
-rewound to a saved checkpoint. jev sends the prompt as pieces split at the end of the
-document and declares that boundary text via `message_delimiters`, so llama-server
-keeps a checkpoint exactly there. The model sees the same characters either way.
+rewound to a saved checkpoint, which llama-server saves immediately before a declared
+`message_delimiters` match. jev-local declares, per request, the question's first property
+name + `":{"` - the first tokens that differ between questions - so the checkpoint lands
+exactly where the next question diverges. The text after the document is sent as its own
+natural token IDs, so the model sees exactly what one plain message would give it.
 
 Usage
   python jev_local.py test
@@ -40,7 +42,7 @@ Environment
   JEV_TOP_LOGPROBS     candidates read per decision  default 50
   JEV_MIN_BRANCH_MASS  skip ambiguous branches below this mass   default 1e-4
   JEV_PREFIX_CHECK     off | first | full: measure how likely the model was to produce the
-                       injected opening itself (debug prefix_prob)   default first
+                       injected opening itself (debug prefix_prob; costs extra passes)   default off
   JEV_SERVER_KEY       Bearer key required by `serve`
 """
 
@@ -91,9 +93,14 @@ from system_one_adapter._client import _serialize_state_as_user_prompt as serial
 from system_one_adapter import _schema as _adapter_schema  # noqa: E402
 from pydantic_core import to_json as _to_json  # noqa: E402  (the adapter's serializer)
 
-# Boundary between the document and the question-specific text, declared to llama-server as a
-# message delimiter so a checkpoint is saved exactly there. It is the adapter's own wording.
-DELIMITER = "\n\n" + SCHEMA_TEMPLATE.split("{schema}")[0].rstrip("\n")
+# Where the checkpoint goes. llama-server saves a checkpoint immediately BEFORE a declared
+# delimiter. jev-local declares, per request, the first question-specific tokens of the schema
+# (the first property name + `":{"`), so the checkpoint lands right after the text every
+# question shares. Fallback, if that can't be matched exactly: the start of the adapter's
+# schema instruction (the document boundary).
+DOC_DELIMITER = "\n\n" + SCHEMA_TEMPLATE.split("{schema}")[0].rstrip("\n")
+_SHARED_END = '"properties":{"'  # the schema text shared by every question ends here (first occurrence)
+_DOC_MARK, _TAIL_MARK = "\x00JEV_DOC\x00", "\x00JEV_TAIL\x00"
 ANSWERS_DESCRIPTION = ("Exactly one answer per property below. Use these property names verbatim and do not add, "
                        "rename, or nest them under any other key.")  # adapter's TypeSafeAnswers docstring; checked in tests.py
 NO_INSTRUCTIONS = "No additional instructions."  # adapter's placeholder for a missing description
@@ -259,6 +266,8 @@ class _Stats:
     prompt_tokens_processed: int = 0
     tokens_decoded: int = 0
     per_request_prompt_n: list[int] = field(default_factory=list)
+    timings: list[dict[str, Any]] = field(default_factory=list)
+    checkpoint: dict[str, Any] = field(default_factory=dict)
     legal_mass: float | None = None
     injected: list[str] = field(default_factory=list)
     unexpanded_mass: float = 0.0
@@ -285,12 +294,16 @@ class JevLocal:
         self.api_key = api_key or os.environ.get("LLAMA_API_KEY") or ""
         self.top_logprobs = top_logprobs or int(os.environ.get("JEV_TOP_LOGPROBS", "50"))
         self.min_branch_mass = float(os.environ.get("JEV_MIN_BRANCH_MASS", "1e-4")) if min_branch_mass is None else min_branch_mass
-        self.prefix_check = (prefix_check or os.environ.get("JEV_PREFIX_CHECK", "first")).lower()
+        self.prefix_check = (prefix_check or os.environ.get("JEV_PREFIX_CHECK", "off")).lower()
         if self.prefix_check not in ("off", "first", "full"):
             raise ValueError("prefix_check must be off, first or full")
         self.timeout = timeout
         self._tok: dict[str, list[int]] = {}
         self._detok: dict[tuple[int, ...], str] = {}
+        self._template: str | None = None  # rendered chat template with placeholders (checked once)
+        self._template_ok: bool | None = None
+        self._delims: list[dict[str, str]] = [{"role": "user", "delimiter": DOC_DELIMITER}]
+        self.last_split: dict[str, Any] = {}
 
     # ---------------------------------------------------------------- transport
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -316,32 +329,98 @@ class JevLocal:
             self._detok[ids] = self._post("/detokenize", {"tokens": list(ids)})["content"] if ids else ""
         return self._detok[ids]
 
-    def _base_pieces(self, state: Any, specs: list[_Spec]) -> list[Any]:
-        """[chat-template head ending with the document, DELIMITER as token IDs, schema instruction + assistant header].
+    def _render(self, user: str) -> str:
+        """The chat template applied to [system, user]. Rendered once with placeholders and reused;
+        the first use is checked against a real /apply-template call, and if the template alters
+        the content the cache is switched off."""
+        def real() -> str:
+            return self._post("/apply-template", {
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
+                "add_generation_prompt": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            })["prompt"]
 
-        The model reads: system = adapter's discrete system prompt; user = adapter's document block,
-        then the adapter's schema instruction with the schema for these questions."""
+        if self._template_ok is False:
+            return real()
+        if self._template is None:
+            self._template = self._post("/apply-template", {
+                "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": _DOC_MARK + _TAIL_MARK}],
+                "add_generation_prompt": True,
+                "chat_template_kwargs": {"enable_thinking": False},
+            })["prompt"]
+        head, rest = self._template.split(_DOC_MARK + _TAIL_MARK, 1)
+        cached = head + user + rest
+        if self._template_ok is None:
+            self._template_ok = cached == real()
+            if not self._template_ok:
+                return real()
+        return cached
+
+    def _base_pieces(self, state: Any, specs: list[_Spec]) -> list[Any]:
+        """[chat-template head ending with the document block, *tail as its natural token IDs].
+
+        The model reads: system = adapter's discrete system prompt; user = adapter's document
+        block, then the adapter's schema instruction with the schema for these questions.
+        Side effect: sets the message delimiter for this question's requests (see _SHARED_END)."""
         instruction = SCHEMA_TEMPLATE.format(schema=_to_json(schema_for(specs)).decode())
-        assert ("\n\n" + instruction).startswith(DELIMITER)
-        user = serialize_document(state) + _SPLIT + ("\n\n" + instruction)[len(DELIMITER):]
-        rendered = self._post("/apply-template", {
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}],
-            "add_generation_prompt": True,
-            "chat_template_kwargs": {"enable_thinking": False},
-        })["prompt"]
+        rendered = self._render(serialize_document(state) + _SPLIT + "\n\n" + instruction)
         head, tail = rendered.split(_SPLIT, 1)
-        # the delimiter goes in as token IDs: same tokenisation the server uses to match
-        # `message_delimiters`, and it makes the prompt a mixed array (= one prompt, not several)
-        return [head, *self._tokenize(DELIMITER), tail]
+        toks = self._post("/tokenize", {"content": tail, "add_special": False, "with_pieces": True})["tokens"]
+        ids = [t["id"] for t in toks]
+        pieces = [t["piece"] for t in toks]
+        d = self._pick_delimiter(tail, ids, pieces, specs)
+        self._delims = [{"role": "user", "delimiter": d}] if d else []
+        return [head, *ids]
+
+    def _pick_delimiter(self, tail: str, ids: list[int], pieces: list[Any], specs: list[_Spec]) -> str:
+        """Choose the delimiter so the checkpoint lands where the questions diverge.
+
+        Preferred: the first property name + `":{"`, starting right after the schema text every
+        question shares. Fallback: the start of the tail (the document boundary). Either way the
+        delimiter is a run of the tail's own natural tokens that (a) starts at a token boundary,
+        (b) tokenises on its own to the same IDs, (c) occurs exactly once in the tail."""
+        self.last_split = {"at": "none (no delimiter matched; near-end checkpoints only)"}
+        if not all(isinstance(p, str) for p in pieces) or "".join(pieces) != tail:
+            return ""
+        starts, pos = [], 0
+        for p in pieces:
+            starts.append(pos)
+            pos += len(p)
+
+        def run_at(i: int, must_start_with: str) -> str | None:
+            for m in range(1, min(len(ids) - i, 64) + 1):
+                text = "".join(pieces[i:i + m])
+                if len(text) < len(must_start_with):
+                    continue
+                if not text.startswith(must_start_with):
+                    return None
+                seq = ids[i:i + m]
+                if sum(1 for j in range(len(ids) - m + 1) if ids[j:j + m] == seq) == 1 and self._tokenize(text) == seq:
+                    return text
+            return None
+
+        split = tail.find(_SHARED_END)
+        if split >= 0 and split + len(_SHARED_END) in starts:
+            i = starts.index(split + len(_SHARED_END))
+            text = run_at(i, json.dumps(specs[0].key, ensure_ascii=False)[1:-1] + '":{"')
+            if text:
+                self.last_split = {"delimiter": text, "at": "divergence point", "shared_tokens": i}
+                return text
+        text = run_at(0, "\n\nReturn")  # the start of the adapter's schema instruction
+        if text:
+            self.last_split = {"delimiter": text, "at": "document boundary", "shared_tokens": 0}
+            return text
+        return ""
 
     def _complete(self, pieces: list[Any], grammar: str, stats: _Stats) -> dict:
         """One request, n_predict=1: prefill the pieces, return the decision entry."""
         prompt = [p for p in pieces if p != ""]  # strings are tokenised by the server, ints are token IDs
         if all(isinstance(p, str) for p in prompt):  # an all-string array would mean several prompts
             prompt = [prompt[0], *self._tokenize("".join(prompt[1:]))] if len(prompt) > 1 else prompt[0]
+        t0 = time.perf_counter()
         data = self._post("/completion", {
             "prompt": prompt,
-            "message_delimiters": [{"role": "user", "delimiter": DELIMITER}],
+            "message_delimiters": self._delims,
             "n_predict": 1,
             "grammar": grammar,
             "n_probs": self.top_logprobs,
@@ -350,16 +429,27 @@ class JevLocal:
             "cache_prompt": True,
             "stream": False,
         })
-        t = data.get("timings") or {}
-        stats.requests += 1
-        n = int(t.get("prompt_n") or 0)
-        stats.prompt_tokens_processed += n
-        stats.per_request_prompt_n.append(n)
-        stats.tokens_decoded += int(t.get("predicted_n") or 0)
+        self._record(data, time.perf_counter() - t0, stats)
         entries = data.get("completion_probabilities") or []
         if not entries:
             raise TypeSafeError("llama-server returned no token probabilities.")
         return entries[0]
+
+    @staticmethod
+    def _record(data: dict, wall_s: float, stats: _Stats) -> None:
+        t = data.get("timings") or {}
+        n = int(t.get("prompt_n") or 0)
+        stats.requests += 1
+        stats.prompt_tokens_processed += n
+        stats.per_request_prompt_n.append(n)
+        stats.tokens_decoded += int(t.get("predicted_n") or 0)
+        stats.timings.append({
+            "prompt_n": n,
+            "prompt_ms": round(float(t.get("prompt_ms") or 0), 2),
+            "predicted_n": int(t.get("predicted_n") or 0),
+            "predicted_ms": round(float(t.get("predicted_ms") or 0), 2),
+            "wall_ms": round(wall_s * 1000, 2),  # includes HTTP, sampling, grammar, checkpoint copies
+        })
 
     @staticmethod
     def _candidates(entry: dict) -> dict[tuple[int, str], float]:
@@ -435,17 +525,18 @@ class JevLocal:
         generated token llama-server reports its raw probability from the unmodified logits,
         exact even when it is far outside the top-k. The product is the probability.
 
-        "first" checks only the first injected token (e.g. `{"`): no extra forward pass,
-        because that token's distribution comes out of the prefill the decision needs anyway.
-        "full" checks every injected token up to the first decision: len(inject) - 1 extra
-        decode steps, all in one request. The generated tokens stay in the prompt cache, so
-        the decision request that follows reuses them."""
+        Cost: the check has to stop right before the injected tokens, so they get their own
+        small pass instead of riding along with the prefill: "first" (only the first injected
+        token, e.g. `{"`) adds about one forward pass per checked question; "full" (every
+        injected token up to the first decision) adds about one per injected token. Off by
+        default; it's a diagnostic."""
         if self.prefix_check == "off" or not inject:
             return
         n = len(inject) if self.prefix_check == "full" else 1
+        t0 = time.perf_counter()
         data = self._post("/completion", {
             "prompt": base,
-            "message_delimiters": [{"role": "user", "delimiter": DELIMITER}],  # keep the document checkpoint
+            "message_delimiters": self._delims,  # keep the checkpoint where it belongs
             "n_predict": n,
             "grammar": "root ::= " + " ".join(f"<[{t}]>" for t in inject[:n]) + "\n",
             "n_probs": 1,
@@ -454,11 +545,7 @@ class JevLocal:
             "cache_prompt": True,
             "stream": False,
         })
-        t = data.get("timings") or {}
-        stats.requests += 1
-        stats.prompt_tokens_processed += int(t.get("prompt_n") or 0)
-        stats.per_request_prompt_n.append(int(t.get("prompt_n") or 0))
-        stats.tokens_decoded += int(t.get("predicted_n") or 0)
+        self._record(data, time.perf_counter() - t0, stats)
         entries = data.get("completion_probabilities") or []
         if [e["id"] for e in entries] != list(inject[:n]):
             raise TypeSafeError("prefix check: forced generation did not reproduce the injected tokens")
@@ -529,6 +616,7 @@ class JevLocal:
         for spec in specs:
             st = _Stats()
             base = self._base_pieces(state, [spec])
+            st.checkpoint = dict(self.last_split)
             if spec.kind == "number":
                 value, p, _ = self._decide_number(base, independent_fixed(spec), ANSWERS_CLOSE, st, check_prefix=True)
                 results[spec.key] = {"kind": "number", "value": value, "probability": p}
@@ -540,11 +628,14 @@ class JevLocal:
 
     def _dependent(self, state: Any, specs: list[_Spec]) -> tuple[dict[str, Any], dict[str, _Stats]]:
         base = self._base_pieces(state, specs)
+        split = dict(self.last_split)
         results: dict[str, Any] = {}
         stats: dict[str, _Stats] = {}
         owed = ANSWERS_OPEN  # text known but not yet in the prompt
         for n, spec in enumerate(specs):
             st = _Stats()
+            if n == 0:
+                st.checkpoint = split
             last = n == len(specs) - 1
             term = ANSWERS_CLOSE if last else ","
             fixed = owed + json.dumps(spec.key) + ": "
@@ -583,11 +674,16 @@ class JevLocal:
                 "requests": st.requests,
                 "prompt_tokens_processed": st.prompt_tokens_processed,
                 "per_request_prompt_n": st.per_request_prompt_n,
+                "timings": st.timings,
+                "server_ms": round(sum(x["prompt_ms"] + x["predicted_ms"] for x in st.timings), 2),
+                "wall_ms": round(sum(x["wall_ms"] for x in st.timings), 2),
                 "tokens_decoded": st.tokens_decoded,
                 "legal_mass": float(f"{st.legal_mass or 0:.4g}"),
                 "injected": st.injected,
                 "decided_after": st.decided_after,
             }
+            if st.checkpoint:
+                info["checkpoint"] = st.checkpoint
             if st.accounted_mass is not None:
                 info["accounted_mass"] = float(f"{st.accounted_mass:.6g}")
             if st.unexpanded_mass:

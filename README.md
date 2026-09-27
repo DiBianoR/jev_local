@@ -26,7 +26,7 @@ Two modes, both with the same guarantee: **the model only ever computes decision
 
 A decision costs one forward pass regardless of how much fixed text precedes it, because the request injects that text as prompt and asks for one token (`n_predict=1`).
 
-**Measured on the test model** (hybrid architecture, 2,700-token document): first question ~2,800 prompt tokens; questions 2–40: 140–180 each (the schema instruction for that question), never the document again. Dependent 10-field form: 1 token decoded per decision, later requests prefilling 6–9 tokens.
+**Measured on the test model** (hybrid architecture, 2,700-token document): first question ~2,800 prompt tokens; questions 2–40: 84–125 each (only the part of the schema that is specific to that question), never the document or the shared schema text again. Dependent 10-field form: 1 token decoded per decision, later requests prefilling 6–9 tokens.
 
 ### Answer types
 
@@ -87,15 +87,17 @@ r.debug["per_question"]["route"]                   # requests, per_request_promp
 * `per_request_prompt_n`: prompt tokens the server actually processed per request. In independent mode the first question's first request should be about the document length and everything else < 100; in dependent mode requests after the first field should be a handful of tokens.
 * `tokens_decoded`: should equal `requests` (one decision per request).
 * `legal_mass`: raw probability on legal tokens at the first decision, given everything injected before it. Close to 1 on a good model.
-* `prefix_prob`: probability that the model, unconstrained, would itself have written the injected opening (`prefix_checked` shows which text): `{"` by default, or the whole `{"is_urgent": ` with `JEV_PREFIX_CHECK=full`. Low means the model was being pushed into a format it wasn't inclined to use. It's exact: the injected tokens are generated under a token-level grammar and llama-server reports their raw probabilities, even far outside the top-k. The default costs no extra forward pass; `full` costs one decode step per extra injected token. Independent mode checks every question; dependent mode checks the form opening (every field's stretch with `full`).
+* `prefix_prob`: probability that the model, unconstrained, would itself have written the injected opening (`prefix_checked` shows which text): off by default; `JEV_PREFIX_CHECK=first` measures `{"`, `full` the whole `{"answers": {"is_urgent": `. Low means the model was being pushed into a format it wasn't inclined to use. It's exact: the injected tokens are generated under a token-level grammar and llama-server reports their raw probabilities, even far outside the top-k. Cost: `first` adds about one forward pass per checked question (the injected tokens get their own small pass), `full` about one per injected token. Independent mode checks every question; dependent mode checks the form opening (every field's stretch with `full`). It's a diagnostic: turn it on to compare prompt wording, leave it off for speed.
 * `injected` / `decided_after`: what was injected and the text at which the answer became certain.
+* `timings`: per request, llama-server's `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms`, plus `wall_ms` measured by jev-local (includes HTTP, sampling, grammar and checkpoint copies). `server_ms` / `wall_ms` per question are the sums. The gap between wall and server time is the per-request overhead.
+* `checkpoint`: where this question's checkpoint was placed (`divergence point`, or the `document boundary` fallback).
 * `accounted_mass`, `unexpanded_mass`: see Probabilities above.
 
 ## How the hybrid-model rewind works
 
-Qwen3.8's recurrent layers can only be rewound to a saved checkpoint. jev-local sends every prompt as pieces split at the end of the document and declares the boundary text (the start of the adapter's schema instruction, `\n\nReturn one JSON object that matches this schema exactly:`) via llama-server's `message_delimiters`, so a checkpoint is saved exactly there; later questions rewind to it. The model sees the same characters as a single message. On the hybrid model each question re-reads the ~60 schema tokens every question shares (a standard-attention model rewinds to the exact divergence point instead); on a GPU that is part of the same single prefill pass. Each decision request also leaves a checkpoint a few tokens before its end, which is what branch expansion rewinds to.
+Qwen3.8's recurrent layers can only be rewound to a saved checkpoint, and llama-server saves one immediately *before* each declared `message_delimiters` match. Everything after the document is identical for every question up to the first property name (56 tokens of schema text), so jev-local declares, per request, that question's first property name plus `":{"` (e.g. `is_urgent":{"`) as the delimiter. The checkpoint lands exactly where questions start to differ, and the next question rewinds to it. The text after the document is sent as its own natural token IDs, so the model sees exactly what it would see in a single message, tokenised normally. If that match isn't possible, jev-local falls back to a delimiter at the start of the schema instruction (the document boundary; each question then also re-reads the 56 shared tokens). `debug.per_question[key].checkpoint` shows which was used. Each decision request also leaves a checkpoint a few tokens before its end, which is what branch expansion rewinds to.
 
-Checkpoints are stored in host RAM, 32 per slot by default. A dependent form creates ~2 per field, so after ~15 fields the document checkpoint can be evicted and the *next* independent question on the same document costs one re-read of up to `ubatch + 4` (516) tokens. `--ctx-checkpoints 64` in the start script pushes that to ~30 fields; raise it further if RAM allows (~100 MB per checkpoint for a 27B).
+Checkpoints are stored in host RAM, 32 per slot by default. A dependent form creates ~2 per field, so after ~15 fields the document checkpoint can be evicted and the *next* independent question on the same document costs one re-read of up to `ubatch + 4` (516) tokens. `--ctx-checkpoints 64` in the start script pushes that to ~30 fields. Each checkpoint of Qwen3.8-27B is ~160 MB (48 recurrent layers × 48 heads × 128 × 128 float32 state), so 64 checkpoints can take ~10 GB of RAM; lower it if RAM is tight.
 
 ## Settings
 
@@ -105,7 +107,7 @@ Checkpoints are stored in host RAM, 32 per slot by default. A dependent form cre
 | `LLAMA_API_KEY` | none | if the server has `--api-key` |
 | `JEV_TOP_LOGPROBS` | 50 | candidates read per decision |
 | `JEV_MIN_BRANCH_MASS` | 1e-4 | `0` = exact |
-| `JEV_PREFIX_CHECK` | `first` | `off` / `first` / `full`, see `prefix_prob` |
+| `JEV_PREFIX_CHECK` | `off` | `off` / `first` / `full`, see `prefix_prob` |
 | `JEV_SERVER_KEY` | none | Bearer key for `serve` |
 
 ## Not done in this version (needs a llama-server fork)

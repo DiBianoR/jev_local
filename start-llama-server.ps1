@@ -27,9 +27,10 @@ $args = @(
     "--parallel", "1",                 # ONE slot. jev-local relies on this slot's prompt cache; more slots re-read the document.
 
     # Hybrid-model checkpoints (Qwen3.8 is Gated-DeltaNet + attention). Each checkpoint stores the recurrent
-    # state in host RAM (~100 MB for a 27B; the exact size is printed in the log with --verbose at
-    # "created context checkpoint"). 64 keeps the end-of-document checkpoint alive through dependent forms
-    # of up to ~30 fields; the default 32 covers ~15. Raise if you have RAM to spare and use longer forms.
+    # state in host RAM: ~160 MB for Qwen3.8-27B (48 recurrent layers x 48 heads x 128 x 128 x float32;
+    # the exact size is printed with --verbose at "created context checkpoint"), so 64 can use ~10 GB RAM.
+    # 64 keeps jev-local's checkpoint alive through dependent forms of up to ~30 fields; the default 32
+    # covers ~15. Lower it if RAM is tight, raise it for longer forms.
     "--ctx-checkpoints", "64",
 
     # Speculative decoding via the MTP head that ships inside the Qwen3.8 GGUF (textgen "spec-type: draft-mtp").

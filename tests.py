@@ -164,14 +164,17 @@ def test_independent_rewind(url: str) -> None:
     later = [r.debug["per_question"][k]["prompt_tokens_processed"] for k in list(qs)[1:]]
 
     def tail_tokens(key: str) -> int:
-        """Tokens after the document (delimiter + schema instruction + assistant header + injected answer)."""
+        """Question-specific tokens: tail after the divergence point + injected answer opening."""
         spec = J._spec(key, qs[key] if key in qs else qs40[key])
         pieces = jev._base_pieces(doc, [spec])
-        return len(jev._tokenize(J.DELIMITER)) + len(jev._tokenize(pieces[-1])) + len(jev._tokenize(J.independent_fixed(spec))) + 2
+        shared = jev.last_split.get("shared_tokens", 0)
+        return sum(isinstance(p, int) for p in pieces) - shared + len(jev._tokenize(J.independent_fixed(spec))) + 2
 
     tails = [tail_tokens(k) for k in list(qs)[1:]]
     check(first > 2000, f"first question read the document ({first} tokens)")
-    check(all(n <= t for n, t in zip(later, tails)), f"questions 2-8 processed {later} prompt tokens: only their own tails ({tails}), not the document")
+    check(all(n <= t for n, t in zip(later, tails)), f"questions 2-8 processed {later} prompt tokens: only their own question-specific tails ({tails}), not the document or the shared schema text")
+    cp = r.debug["per_question"]["q1"].get("checkpoint", {})
+    check(cp.get("at") == "divergence point", f"checkpoint at the divergence point, after {cp.get('shared_tokens')} shared tokens, delimiter {cp.get('delimiter')!r}")
     r = jev.system_one(doc, qs40, mode="independent")
     later = [r.debug["per_question"][k]["prompt_tokens_processed"] for k in qs40]
     over = [(k, n, tail_tokens(k)) for k, n in zip(qs40, later) if n > tail_tokens(k)]
@@ -268,6 +271,26 @@ def test_prefix_prob(url: str) -> None:
             check(rel < 1e-3, f"[{mode}] {key}: prefix_prob {info['prefix_prob']:.4g} vs full-vocab readout {ref:.4g} ({info['prefix_checked']!r})")
 
 
+def test_checkpoint_placement(url: str) -> None:
+    print("7. checkpoint placement: divergence point, fallback, unusual keys, template cache")
+    doc = "short document"
+    jev = J.JevLocal(url)
+    for key in ("is_urgent", "größe", "a b", "x"):
+        jev._base_pieces(doc, [J._spec(key, J.Noul())])
+        check(jev.last_split.get("at") == "divergence point", f"key {key!r}: checkpoint at {jev.last_split.get('at')} (delimiter {jev.last_split.get('delimiter')!r})")
+    saved = J._SHARED_END
+    try:
+        J._SHARED_END = "NO_SUCH_TEXT"  # break the preferred match
+        jev._base_pieces(doc, [J._spec("is_urgent", J.Noul())])
+        check(jev.last_split.get("at") == "document boundary", f"fallback: checkpoint at {jev.last_split.get('at')} (delimiter {jev.last_split.get('delimiter')!r})")
+    finally:
+        J._SHARED_END = saved
+    check(jev._template_ok is True, "cached chat template matches /apply-template exactly")
+    r = jev.system_one(doc, {"u": J.Noul()})
+    t = r.debug["per_question"]["u"]["timings"]
+    check(len(t) == r.debug["per_question"]["u"]["requests"] and all({"prompt_ms", "predicted_ms", "wall_ms"} <= set(x) for x in t), f"per-request timings recorded: {t}")
+
+
 def main() -> int:
     url = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("LLAMA_URL", "http://127.0.0.1:5005")
     k = int(sys.argv[sys.argv.index("--brute-k") + 1]) if "--brute-k" in sys.argv else 4000
@@ -279,6 +302,7 @@ def main() -> int:
     test_branch_expansion(url)
     test_misc_and_server(url)
     test_prefix_prob(url)
+    test_checkpoint_placement(url)
     print("\nALL PASSED" if not FAILS else f"\n{len(FAILS)} FAILED:\n  " + "\n  ".join(FAILS))
     return 0 if not FAILS else 1
 

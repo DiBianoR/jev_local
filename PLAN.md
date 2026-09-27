@@ -131,10 +131,18 @@ All of §6 items 1-4 and 6 pass on both synthetic models (standard-attention `qw
   weak model emit digits forever; numbers are now capped at 15 integer + 6 fraction digits.
 - §6 item 5 (injected-tokenisation effect on the real model) is still open; runs on Robert's machine.
 
+## 6c. Per-question overhead cuts (2026-09-26)
+
+- **Checkpoint at the divergence point.** llama-server checkpoints immediately *before* a delimiter match, so declaring shared text as the delimiter can't place the checkpoint after it. jev-local now declares, per request, the first property name + `":{"` (e.g. `is_urgent":{"`): the first question-specific tokens. The bare name would be wrong: it also appears later in `"required":["is_urgent"]`, and llama-server checkpoints the last match. The post-document text is sent as its natural token IDs, so nothing is re-tokenised at the split. Measured on the hybrid test model: per-question prompt tokens 140-180 -> 84-125 (the 56 shared schema tokens are no longer re-read).
+  > **Choice made — fallback.** If the preferred delimiter can't be matched exactly (a token straddling the boundary, a name that doesn't tokenise the same on its own), fall back to the start of the schema instruction (document boundary; +56 tokens per question) rather than to no checkpoint. Both delimiters are chosen from the tail's own natural tokens. The first version used the literal instruction text, which never matched: in the natural tokenisation `exactly:` merges with the following blank line.
+- **prefix check off by default** (it costs ~1 forward pass per checked question, not 0 as first claimed).
+- **Per-request timings** (`prompt_ms`, `predicted_ms`, `wall_ms`) in debug, for measuring on the real GPU.
+- **Chat template rendered once** with placeholders; the first use is compared against a real `/apply-template` call, and the cache is disabled if they differ.
+
 ## 7. Deferred / fork-only improvements (summary)
 
 | Improvement | Needs fork? | Gain |
 |---|---|---|
-| Explicit checkpoint positions | yes | removes delimiter text-matching, frees checkpoint budget |
+| Explicit checkpoint positions | yes | removes delimiter token-matching (and its fallback), frees checkpoint budget |
 | Option C: batched multi-question decode over one shared document | yes | independent-mode time ~independent of question count |
 | Prompt-token logprobs (logits at several prompt positions in one pass) | yes | `prefix_prob` for the whole injected opening at no extra decode cost (today `full` costs 1 step per token) |
